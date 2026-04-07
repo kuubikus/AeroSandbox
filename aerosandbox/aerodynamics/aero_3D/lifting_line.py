@@ -344,6 +344,102 @@ class LiftingLine(ExplicitAnalysis):
                 ]
             )
 
+    def _discretize_wing_continuous(self, wing: Wing):
+        if self.spanwise_resolution > 1:
+            wing = wing.subdivide_sections(
+                ratio=self.spanwise_resolution,
+                spacing_function=self.spanwise_spacing_function,
+            )
+
+        xsecs = wing.xsecs
+
+        q_nodes = []
+        chord_nodes = []
+        airfoil_nodes = []
+        control_surface_nodes = []
+
+        for i, (xsec_a, xsec_b) in enumerate(zip(xsecs[:-1], xsecs[1:])):
+            xyz_le_a = np.array(xsec_a.xyz_le)
+            xyz_le_b = np.array(xsec_b.xyz_le)
+
+            xyz_te_a = xyz_le_a + np.array([xsec_a.chord, 0, 0])
+            xyz_te_b = xyz_le_b + np.array([xsec_b.chord, 0, 0])
+
+            q_a = 0.75 * xyz_le_a + 0.25 * xyz_te_a
+            q_b = 0.75 * xyz_le_b + 0.25 * xyz_te_b
+
+            if i == 0:
+                q_nodes.append(q_a)
+                chord_nodes.append(xsec_a.chord)
+                airfoil_nodes.append(xsec_a.airfoil)
+                control_surface_nodes.append(xsec_a.control_surfaces)
+
+            q_nodes.append(q_b)
+            chord_nodes.append(xsec_b.chord)
+            airfoil_nodes.append(xsec_b.airfoil)
+            control_surface_nodes.append(xsec_b.control_surfaces)
+
+        q_nodes = np.array(q_nodes)
+        chord_nodes = np.array(chord_nodes)
+
+        if wing.symmetric:
+            q_nodes_right = q_nodes.copy()
+            chord_nodes_right = chord_nodes.copy()
+            airfoil_nodes_right = airfoil_nodes.copy()
+            control_surface_nodes_right = control_surface_nodes.copy()
+
+            q_nodes_left = q_nodes_right[::-1].copy()
+            q_nodes_left[:, 1] *= -1
+
+            chord_nodes_left = chord_nodes_right[::-1].copy()
+            airfoil_nodes_left = airfoil_nodes_right[::-1]
+            control_surface_nodes_left = []
+
+            for surfs in control_surface_nodes_right[::-1]:
+                mirrored_surfs = []
+                for surf in surfs:
+                    if surf.symmetric:
+                        mirrored_surfs.append(surf)
+                    else:
+                        s = surf.copy()
+                        s.deflection *= -1
+                        mirrored_surfs.append(s)
+                control_surface_nodes_left.append(mirrored_surfs)
+
+            # remove duplicate centerline node
+            q_nodes = np.concatenate([q_nodes_left[:-1], q_nodes_right], axis=0)
+            chord_nodes = np.concatenate([chord_nodes_left[:-1], chord_nodes_right], axis=0)
+            airfoil_nodes = airfoil_nodes_left[:-1] + airfoil_nodes_right
+            control_surface_nodes = control_surface_nodes_left[:-1] + control_surface_nodes_right
+
+        left_vortex_vertices = q_nodes[:-1]
+        right_vortex_vertices = q_nodes[1:]
+        vortex_bound_leg = right_vortex_vertices - left_vortex_vertices
+        vortex_centers = 0.5 * (left_vortex_vertices + right_vortex_vertices)
+
+        chords = 0.5 * (chord_nodes[:-1] + chord_nodes[1:])
+
+        airfoils = [
+            airfoil_nodes[i].blend_with_another_airfoil(
+                airfoil=airfoil_nodes[i + 1],
+                blend_fraction=0.5,
+            )
+            for i in range(len(airfoil_nodes) - 1)
+        ]
+
+        control_surfaces = control_surface_nodes[:-1]
+
+        return {
+            "left_vortex_vertices": left_vortex_vertices,
+            "right_vortex_vertices": right_vortex_vertices,
+            "vortex_centers": vortex_centers,
+            "vortex_bound_leg": vortex_bound_leg,
+            "chords": chords,
+            "airfoils": airfoils,
+            "control_surfaces": control_surfaces,
+        }
+
+
     def run(self) -> Dict:
         """
         Computes the aerodynamic forces.
@@ -640,103 +736,58 @@ class LiftingLine(ExplicitAnalysis):
         if self.verbose:
             print("Meshing...")
 
-        ##### Make Panels
-        front_left_vertices = []
-        back_left_vertices = []
-        back_right_vertices = []
-        front_right_vertices = []
-        airfoils: List[Airfoil] = []
-        control_surfaces: List[List[ControlSurface]] = []
+        left_vortex_vertices = []
+        right_vortex_vertices = []
+        vortex_centers = []
+        vortex_bound_leg = []
+        chords = []
+        airfoils = []
+        control_surfaces = []
         panel_owner = []
 
-        for wing in self.airplane.wings:  # subdivide the wing in more spanwise sections
-            if self.spanwise_resolution > 1:
-                wing = wing.subdivide_sections(
-                    ratio=self.spanwise_resolution,
-                    spacing_function=self.spanwise_spacing_function,
-                )
+        for wing_id, wing in enumerate(self.airplane.wings):
+            disc = self._discretize_wing_continuous(wing)
 
-            points, faces = wing.mesh_thin_surface(
-                method="quad",
-                chordwise_resolution=1,
-                add_camber=False,
-            )
+            n = len(disc["chords"])
 
-            n_panels_this_side = faces.shape[0]
-            panel_owner.extend([wing.name] * n_panels_this_side)
+            left_vortex_vertices.append(disc["left_vortex_vertices"])
+            right_vortex_vertices.append(disc["right_vortex_vertices"])
+            vortex_centers.append(disc["vortex_centers"])
+            vortex_bound_leg.append(disc["vortex_bound_leg"])
+            chords.append(disc["chords"])
+            airfoils.extend(disc["airfoils"])
+            control_surfaces.extend(disc["control_surfaces"])
+            panel_owner.extend([wing_id] * n)
 
-            front_left_vertices.append(points[faces[:, 0], :])
-            back_left_vertices.append(points[faces[:, 1], :])
-            back_right_vertices.append(points[faces[:, 2], :])
-            front_right_vertices.append(points[faces[:, 3], :])
-
-            wing_airfoils = []
-            wing_control_surfaces = []
-
-            for xsec_a, xsec_b in zip(
-                wing.xsecs[:-1], wing.xsecs[1:]
-            ):  # Do the right side
-                wing_airfoils.append(
-                    xsec_a.airfoil.blend_with_another_airfoil(
-                        airfoil=xsec_b.airfoil,
-                        blend_fraction=0.5,
-                    )
-                )
-                wing_control_surfaces.append(xsec_a.control_surfaces)
-
-            airfoils.extend(wing_airfoils)
-            control_surfaces.extend(wing_control_surfaces)
-
-            if wing.symmetric:  # Do the left side, if applicable
-                airfoils.extend(wing_airfoils)
-
-                def mirror_control_surface(surf: ControlSurface) -> ControlSurface:
-                    if surf.symmetric:
-                        return surf
-                    else:
-                        surf = surf.copy()
-                        surf.deflection *= -1
-                        return surf
-
-                symmetric_wing_control_surfaces = [
-                    [mirror_control_surface(surf) for surf in surfs]
-                    for surfs in wing_control_surfaces
-                ]
-
-                control_surfaces.extend(symmetric_wing_control_surfaces)
-
-        front_left_vertices = np.concatenate(front_left_vertices)
-        back_left_vertices = np.concatenate(back_left_vertices)
-        back_right_vertices = np.concatenate(back_right_vertices)
-        front_right_vertices = np.concatenate(front_right_vertices)
+        left_vortex_vertices = np.concatenate(left_vortex_vertices, axis=0)
+        right_vortex_vertices = np.concatenate(right_vortex_vertices, axis=0)
+        vortex_centers = np.concatenate(vortex_centers, axis=0)
+        vortex_bound_leg = np.concatenate(vortex_bound_leg, axis=0)
+        chords = np.concatenate(chords, axis=0)
         panel_owner = np.array(panel_owner)
 
-        ### Compute panel statistics
-        diag1 = front_right_vertices - back_left_vertices
-        diag2 = front_left_vertices - back_right_vertices
-        cross = np.cross(diag1, diag2)
-        cross_norm = np.linalg.norm(cross, axis=1)
-        normal_directions = cross / tall(cross_norm)
-        areas = cross_norm / 2
-
-        # Compute the location of points of interest on each panel
-        left_vortex_vertices = 0.75 * front_left_vertices + 0.25 * back_left_vertices
-        right_vortex_vertices = 0.75 * front_right_vertices + 0.25 * back_right_vertices
-        vortex_centers = (left_vortex_vertices + right_vortex_vertices) / 2
-        vortex_bound_leg = right_vortex_vertices - left_vortex_vertices
         vortex_bound_leg_norm = np.linalg.norm(vortex_bound_leg, axis=1)
-        chord_vectors = (back_left_vertices + back_right_vertices) / 2 - (
-            front_left_vertices + front_right_vertices
-        ) / 2
-        chords = np.linalg.norm(chord_vectors, axis=1)
         wing_directions = vortex_bound_leg / tall(vortex_bound_leg_norm)
+
+        steady_freestream_velocity = self.op_point.compute_freestream_velocity_geometry_axes()
+        steady_freestream_direction = steady_freestream_velocity / np.linalg.norm(
+            steady_freestream_velocity
+        )
+
+        freestream_dirs_temp = np.tile(wide(steady_freestream_direction), reps=(len(chords), 1))
+
+        z_geom = np.array([0.0, 0.0, 1.0])
+        normal_directions = np.cross(wing_directions, freestream_dirs_temp)
+        normal_directions = normal_directions / tall(np.linalg.norm(normal_directions, axis=1))
+
         local_forward_direction = np.cross(normal_directions, wing_directions)
+        local_forward_direction = local_forward_direction / tall(
+            np.linalg.norm(local_forward_direction, axis=1)
+        )
+
+        areas = chords * vortex_bound_leg_norm
 
         ### Save things to the instance for later access
-        self.front_left_vertices = front_left_vertices
-        self.back_left_vertices = back_left_vertices
-        self.back_right_vertices = back_right_vertices
-        self.front_right_vertices = front_right_vertices
         self.airfoils: List[Airfoil] = airfoils
         self.control_surfaces: List[List[ControlSurface]] = control_surfaces
         self.normal_directions = normal_directions
@@ -745,7 +796,6 @@ class LiftingLine(ExplicitAnalysis):
         self.right_vortex_vertices = right_vortex_vertices
         self.vortex_centers = vortex_centers
         self.vortex_bound_leg = vortex_bound_leg
-        self.chord_vectors = chord_vectors
         self.chords = chords
         self.local_forward_direction = local_forward_direction
         self.n_panels = areas.shape[0]
@@ -792,13 +842,13 @@ class LiftingLine(ExplicitAnalysis):
             steady_freestream_directions * -local_forward_direction, axis=1
         )
 
-        machs = self.op_point.mach() * cos_sweeps
-
+        cos_sweeps_safe = np.maximum(np.abs(cos_sweeps), 1e-6)
+        machs = self.op_point.mach() * cos_sweeps_safe
         Res = (
             self.op_point.velocity
             * chords
             / self.op_point.atmosphere.kinematic_viscosity()
-        ) * cos_sweeps
+        ) * cos_sweeps_safe
 
         # ### Do a central finite-difference in alpha to obtain CL0 and CLa quantities
         # finite_difference_alpha_amount = 1  # degree
@@ -889,7 +939,7 @@ class LiftingLine(ExplicitAnalysis):
         )
         V_freestream_cross_li_magnitudes = np.linalg.norm(V_freestream_cross_li, axis=1)
 
-        velocity_magnitude_perpendiculars = self.op_point.velocity * cos_sweeps
+        velocity_magnitude_perpendiculars = self.op_point.velocity * cos_sweeps_safe
 
         A = alpha_influence_matrix * np.tile(wide(CLas), (self.n_panels, 1)) - np.diag(
             2
@@ -975,7 +1025,7 @@ class LiftingLine(ExplicitAnalysis):
         moment_profile_geometry = np.sum(moments_profile_geometry, axis=0)
 
         # Compute pitching moment
-        bound_leg_YZ = vortex_bound_leg
+        bound_leg_YZ = vortex_bound_leg.copy()
         bound_leg_YZ[:, 0] = 0
         moments_pitching_geometry = (
             (0.5 * self.op_point.atmosphere.density() * tall(velocity_magnitudes**2))
@@ -995,8 +1045,8 @@ class LiftingLine(ExplicitAnalysis):
 
         wing_results = {}
 
-        for wing in self.airplane.wings:
-            mask = panel_owner == wing.name
+        for wing_id, wing in enumerate(self.airplane.wings):
+            mask = panel_owner == wing_id
 
             wing_results[wing.name] = self.AeroComponentResults(
                 s_ref=wing.area(),
