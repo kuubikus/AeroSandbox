@@ -356,6 +356,8 @@ class LiftingLine(ExplicitAnalysis):
         q_nodes = []
         chord_nodes = []
         airfoil_nodes = []
+        le_nodes = []
+        te_nodes = []
         control_surface_nodes = []
 
         for i, (xsec_a, xsec_b) in enumerate(zip(xsecs[:-1], xsecs[1:])):
@@ -373,17 +375,25 @@ class LiftingLine(ExplicitAnalysis):
                 chord_nodes.append(xsec_a.chord)
                 airfoil_nodes.append(xsec_a.airfoil)
                 control_surface_nodes.append(xsec_a.control_surfaces)
+                le_nodes.append(xyz_le_a)
+                te_nodes.append(xyz_te_a)
 
             q_nodes.append(q_b)
             chord_nodes.append(xsec_b.chord)
             airfoil_nodes.append(xsec_b.airfoil)
             control_surface_nodes.append(xsec_b.control_surfaces)
+            le_nodes.append(xyz_le_b)
+            te_nodes.append(xyz_te_b)
 
         q_nodes = np.array(q_nodes)
         chord_nodes = np.array(chord_nodes)
+        le_nodes = np.array(le_nodes)
+        te_nodes = np.array(te_nodes)
 
         if wing.symmetric:
             q_nodes_right = q_nodes.copy()
+            le_nodes_right = le_nodes.copy()
+            te_nodes_right = te_nodes.copy()
             chord_nodes_right = chord_nodes.copy()
             airfoil_nodes_right = airfoil_nodes.copy()
             control_surface_nodes_right = control_surface_nodes.copy()
@@ -391,10 +401,16 @@ class LiftingLine(ExplicitAnalysis):
             q_nodes_left = q_nodes_right[::-1].copy()
             q_nodes_left[:, 1] *= -1
 
+            le_nodes_left = le_nodes_right[::-1].copy()
+            le_nodes_left[:, 1] *= -1
+
+            te_nodes_left = te_nodes_right[::-1].copy()
+            te_nodes_left[:, 1] *= -1
+
             chord_nodes_left = chord_nodes_right[::-1].copy()
             airfoil_nodes_left = airfoil_nodes_right[::-1]
-            control_surface_nodes_left = []
 
+            control_surface_nodes_left = []
             for surfs in control_surface_nodes_right[::-1]:
                 mirrored_surfs = []
                 for surf in surfs:
@@ -406,6 +422,14 @@ class LiftingLine(ExplicitAnalysis):
                         mirrored_surfs.append(s)
                 control_surface_nodes_left.append(mirrored_surfs)
 
+            # drop one centerline node to avoid duplication
+            q_nodes = np.concatenate([q_nodes_left[:-1], q_nodes_right], axis=0)
+            le_nodes = np.concatenate([le_nodes_left[:-1], le_nodes_right], axis=0)
+            te_nodes = np.concatenate([te_nodes_left[:-1], te_nodes_right], axis=0)
+            chord_nodes = np.concatenate([chord_nodes_left[:-1], chord_nodes_right], axis=0)
+            airfoil_nodes = airfoil_nodes_left[:-1] + airfoil_nodes_right
+            control_surface_nodes = control_surface_nodes_left[:-1] + control_surface_nodes_right
+
             # remove duplicate centerline node
             q_nodes = np.concatenate([q_nodes_left[:-1], q_nodes_right], axis=0)
             chord_nodes = np.concatenate([chord_nodes_left[:-1], chord_nodes_right], axis=0)
@@ -414,10 +438,15 @@ class LiftingLine(ExplicitAnalysis):
 
         left_vortex_vertices = q_nodes[:-1]
         right_vortex_vertices = q_nodes[1:]
-        vortex_bound_leg = right_vortex_vertices - left_vortex_vertices
         vortex_centers = 0.5 * (left_vortex_vertices + right_vortex_vertices)
+        vortex_bound_leg = right_vortex_vertices - left_vortex_vertices
 
         chords = 0.5 * (chord_nodes[:-1] + chord_nodes[1:])
+
+        chord_vectors = 0.5 * (
+            (te_nodes[:-1] - le_nodes[:-1]) +
+            (te_nodes[1:] - le_nodes[1:])
+        )
 
         airfoils = [
             airfoil_nodes[i].blend_with_another_airfoil(
@@ -437,6 +466,7 @@ class LiftingLine(ExplicitAnalysis):
             "chords": chords,
             "airfoils": airfoils,
             "control_surfaces": control_surfaces,
+            "chord_vectors": chord_vectors,
         }
 
 
@@ -744,6 +774,7 @@ class LiftingLine(ExplicitAnalysis):
         airfoils = []
         control_surfaces = []
         panel_owner = []
+        chord_vectors = []
 
         for wing_id, wing in enumerate(self.airplane.wings):
             disc = self._discretize_wing_continuous(wing)
@@ -758,27 +789,27 @@ class LiftingLine(ExplicitAnalysis):
             airfoils.extend(disc["airfoils"])
             control_surfaces.extend(disc["control_surfaces"])
             panel_owner.extend([wing_id] * n)
+            chord_vectors.extend(disc["chord_vectors"])
 
         left_vortex_vertices = np.concatenate(left_vortex_vertices, axis=0)
         right_vortex_vertices = np.concatenate(right_vortex_vertices, axis=0)
         vortex_centers = np.concatenate(vortex_centers, axis=0)
         vortex_bound_leg = np.concatenate(vortex_bound_leg, axis=0)
         chords = np.concatenate(chords, axis=0)
+        chord_vectors = np.concatenate(chord_vectors, axis=0)
         panel_owner = np.array(panel_owner)
+
+        self.chord_vectors = chord_vectors
 
         vortex_bound_leg_norm = np.linalg.norm(vortex_bound_leg, axis=1)
         wing_directions = vortex_bound_leg / tall(vortex_bound_leg_norm)
 
-        steady_freestream_velocity = self.op_point.compute_freestream_velocity_geometry_axes()
-        steady_freestream_direction = steady_freestream_velocity / np.linalg.norm(
-            steady_freestream_velocity
-        )
+        chord_norm = np.maximum(np.linalg.norm(chord_vectors, axis=1), 1e-12)
+        local_forward_direction = chord_vectors / tall(chord_norm)
 
-        freestream_dirs_temp = np.tile(wide(steady_freestream_direction), reps=(len(chords), 1))
-
-        z_geom = np.array([0.0, 0.0, 1.0])
-        normal_directions = np.cross(wing_directions, freestream_dirs_temp)
-        normal_directions = normal_directions / tall(np.linalg.norm(normal_directions, axis=1))
+        normal_unnormalized = np.cross(local_forward_direction, wing_directions)
+        normal_norm = np.maximum(np.linalg.norm(normal_unnormalized, axis=1), 1e-12)
+        normal_directions = normal_unnormalized / tall(normal_norm)
 
         local_forward_direction = np.cross(normal_directions, wing_directions)
         local_forward_direction = local_forward_direction / tall(
@@ -834,9 +865,11 @@ class LiftingLine(ExplicitAnalysis):
         self.freestream_velocities = freestream_velocities
 
         ##### Compute the linearization quantities (CL0 and CLa) of each airfoil section
-        alpha_geometrics = 90 - np.arccosd(
-            np.sum(steady_freestream_directions * normal_directions, axis=1)
-        )
+        Vhat = steady_freestream_directions
+        u = -np.sum(Vhat * local_forward_direction, axis=1)   # flow along chord
+        w = np.sum(Vhat * normal_directions, axis=1)          # flow normal to chord plane
+
+        alpha_geometrics = np.arctan2d(w, u)
 
         cos_sweeps = np.sum(
             steady_freestream_directions * -local_forward_direction, axis=1
