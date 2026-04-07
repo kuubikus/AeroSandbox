@@ -116,9 +116,12 @@ class AeroBuildup(ExplicitAnalysis):
         span_effective: float
         # The effective span of the component's Trefftz-plane wake, used for induced drag calculations. [m]
         oswalds_efficiency: float  # Oswald's efficiency factor [-]
-        section_y: List[float] # The y locations of the sections, for reference. [m]
-        section_F_g: List[List[Union[float, np.ndarray]]] # The forces on each section, in geometry axes, for reference. [N]
-        section_M_g: List[List[Union[float, np.ndarray]]] # The moments on each section, in geometry axes, for reference. [Nm]
+        section_y: List[float] = None # The y locations of the sections, for reference. [m]
+        section_F_g: List[List[Union[float, np.ndarray]]] = None # The forces on each section, in geometry axes, for reference. [N]
+        section_M_g: List[List[Union[float, np.ndarray]]] = None # The moments on each section, in geometry axes, for reference. [Nm]
+        section_CL: List[Union[float, np.ndarray]] = None # The lift coefficient on each section, for reference. [-]
+        section_Cm: List[Union[float, np.ndarray]] = None # The pitching moment coefficient on each section, for reference. [-]
+        section_CD: List[Union[float, np.ndarray]] = None # The drag coefficient on each section, for reference. [-]
 
         def __repr__(self):
             F_w = self.F_w
@@ -217,28 +220,25 @@ class AeroBuildup(ExplicitAnalysis):
             The yawing moment [Nm] in body axes. Positive is nose-right.
             """
             return self.M_b[2]
-        
-        @property
-        def section_y(self) -> List[float]:
-            """
-            The y locations of the sections, for reference. [m]
-            """
-            return self.section_y
-        
-        @property
-        def section_F_g(self) -> List[List[Union[float, np.ndarray]]]:
-            """
-            The forces on each section, in geometry axes, for reference. [N]
-            """
-            return self.section_F_g
-        
-        @property
-        def section_M_g(self) -> List[List[Union[float, np.ndarray]]]:
-            """
-            The moments on each section, in geometry axes, for reference. [Nm]
-            """
-            return self.section_M_g
 
+        def section_F_w(self) -> List[List[Union[float, np.ndarray]]]:
+            """
+            The forces on each section, in wind axes, for reference. [N]
+            """
+            return [
+                self.op_point.convert_axes(*F_g, from_axes="geometry", to_axes="wind")
+                for F_g in self.section_F_g
+            ]
+
+        def section_M_w(self) -> List[List[Union[float, np.ndarray]]]:
+            """
+            The moments on each section, in wind axes, for reference. [Nm]
+            """
+            return [
+                self.op_point.convert_axes(*M_g, from_axes="geometry", to_axes="wind")
+                for M_g in self.section_M_g
+            ]
+        
     def run(
         self,
     ) -> Dict[str, Union[Union[float, np.ndarray], List[Union[float, np.ndarray]]]]:
@@ -893,7 +893,7 @@ class AeroBuildup(ExplicitAnalysis):
             M_g_pitching_moment = [M_direction_g[i] * sect_M for i in range(3)]
             sect_M_g = [M_g_lift[i] + M_g_pitching_moment[i] for i in range(3)]
 
-            return sect_F_g, sect_M_g
+            return sect_F_g, sect_M_g, sect_CL, sect_CD, sect_CM
 
         ##### Iterate through all sections and add up all forces/moments.
         F_g = [0.0, 0.0, 0.0]
@@ -901,27 +901,36 @@ class AeroBuildup(ExplicitAnalysis):
         section_y = []
         section_F_g = [] # In geometry axes
         section_M_g = [] # In geometry axes
+        section_CL = []
+        section_CD = []
+        section_CM = []
 
         for sect_id in range(len(wing.xsecs) - 1):
-            sect_F_g, sect_M_g = compute_section_aerodynamics(sect_id=sect_id)
+            sect_F_g, sect_M_g, sect_CL, sect_CD, sect_CM = compute_section_aerodynamics(sect_id=sect_id)
 
             y = 0.5*(xsec_quarter_chords[sect_id][1] + xsec_quarter_chords[sect_id+1][1])
             section_y.append(y)
             section_F_g.append(sect_F_g)
             section_M_g.append(sect_M_g)
+            section_CL.append(sect_CL)
+            section_CD.append(sect_CD)
+            section_CM.append(sect_CM)
 
             for i in range(3):
                 F_g[i] += sect_F_g[i]
                 M_g[i] += sect_M_g[i]
 
             if wing.symmetric:
-                sect_F_g, sect_M_g = compute_section_aerodynamics(
+                sect_F_g, sect_M_g, sect_CL, sect_CD, sect_CM = compute_section_aerodynamics(
                     sect_id=sect_id, mirror_across_XZ=True
                 )
                 y = -0.5*(xsec_quarter_chords[sect_id][1] + xsec_quarter_chords[sect_id+1][1])
                 section_y.append(y)
                 section_F_g.append(sect_F_g)
                 section_M_g.append(sect_M_g)
+                section_CL.append(sect_CL)
+                section_CD.append(sect_CD)
+                section_CM.append(sect_CM)
 
                 for i in range(3):
                     F_g[i] += sect_F_g[i]
@@ -939,6 +948,9 @@ class AeroBuildup(ExplicitAnalysis):
             section_y=section_y,
             section_F_g=section_F_g,
             section_M_g=section_M_g,
+            section_CL=section_CL,
+            section_CD=section_CD,  
+            section_Cm=section_CM,
         )
 
     def fuselage_aerodynamics(

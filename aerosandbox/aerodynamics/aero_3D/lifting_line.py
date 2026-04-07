@@ -138,6 +138,19 @@ class LiftingLine(ExplicitAnalysis):
         M_g: List[
             Union[float, np.ndarray]
         ]  # An [x, y, z] list of moments about geometry axes [Nm]
+        panel_centers: np.ndarray  # An Nx3 array of panel center locations in geometry axes [m]
+        panel_areas: np.ndarray  # An N-array of panel areas [m^2]
+        panel_forces_g: np.ndarray  # An Nx3 array of panel forces in geometry axes [N]
+        panel_moments_g: np.ndarray  # An Nx3 array of panel moments about geometry axes [Nm]
+        panel_forces_g_inviscid: np.ndarray  # An Nx3 array of panel forces in geometry axes [N] due to inviscid effects only
+        panel_forces_g_profile: np.ndarray  # An Nx3 array of panel forces in geometry axes [N] due to viscous effects only
+        panel_moments_g_inviscid: np.ndarray  # An Nx3 array of panel moments about geometry axes [Nm] due to inviscid effects only
+        panel_moments_g_profile: np.ndarray  # An Nx3 array of panel moments about geometry axes [Nm] due to viscous effects only
+        panel_moments_g_pitching: np.ndarray  # An Nx3 array of panel moments about geometry axes [Nm] due to pitching moment effects only
+        section_CL: np.ndarray  # An N-array of section lift coefficients [-]
+        section_CD: np.ndarray  # An N-array of section drag coefficients [-]
+        section_CM: np.ndarray  # An N-array of section moment coefficients [-]
+        panel_velocities: np.ndarray  # An Nx3 array of panel velocities in geometry axes [m/s]
 
         def __repr__(self):
             F_w = self.F_w
@@ -236,6 +249,101 @@ class LiftingLine(ExplicitAnalysis):
             """
             return self.M_b[2]
 
+        @property
+        def panel_forces_w(self) -> np.ndarray:
+            """
+            An Nx3 array of panel forces in wind axes [N]
+            """
+            return np.array(
+                [
+                    self.op_point.convert_axes(*f_g, from_axes="geometry", to_axes="wind")
+                    for f_g in self.panel_forces_g
+                ]
+            )
+
+        @property
+        def panel_forces_inviscid_w(self) -> np.ndarray:
+            """
+            An Nx3 array of panel forces in wind axes [N] due to inviscid effects only
+            """
+            return np.array(
+                [
+                    self.op_point.convert_axes(
+                        *f_g, from_axes="geometry", to_axes="wind"
+                    )
+                    for f_g in self.panel_forces_g_inviscid
+                ]
+            )
+
+        @property
+        def panel_forces_profile_w(self) -> np.ndarray:
+            """
+            An Nx3 array of panel forces in wind axes [N] due to viscous effects only
+            """
+            return np.array(
+                [
+                    self.op_point.convert_axes(
+                        *f_g, from_axes="geometry", to_axes="wind"
+                    )
+                    for f_g in self.panel_forces_g_profile
+                ]
+            )    
+        
+        @property
+        def panel_moments_w(self) -> np.ndarray:
+            """
+            An Nx3 array of panel moments about wind axes [Nm]
+            """
+            return np.array(
+                [
+                    self.op_point.convert_axes(*m_g, from_axes="geometry", to_axes="wind")
+                    for m_g in self.panel_moments_g
+                ]
+            )
+
+
+        @property
+        def panel_moments_inviscid_w(self) -> np.ndarray:
+            """
+            An Nx3 array of panel moments about wind axes [Nm] due to inviscid effects only
+            """
+            return np.array(
+                [
+                    self.op_point.convert_axes(
+                        *m_g, from_axes="geometry", to_axes="wind"
+                    )
+                    for m_g in self.panel_moments_g_inviscid
+                ]
+            )
+        
+        @property
+        def panel_moments_profile_w(self) -> np.ndarray:
+            """
+            An Nx3 array of panel moments about wind axes [Nm] due to viscous effects only
+            """
+            return np.array(
+                [
+                    self.op_point.convert_axes(
+                        *m_g, from_axes="geometry", to_axes="wind"
+                    )
+                    for m_g in self.panel_moments_g_profile
+                ]
+            )
+
+        @property
+        def panel_moments_pitching_w(self) -> np.ndarray:
+            """
+            An Nx3 array of panel moments about wind axes [Nm] due to pitching moment effects only
+            """
+            return np.array(
+                [
+                    self.op_point.convert_axes(
+                        *m_g, from_axes="geometry", to_axes="wind"
+                    )
+                    for m_g in self.panel_moments_g_pitching
+                ]
+            )
+
     def run(self) -> Dict:
         """
         Computes the aerodynamic forces.
@@ -281,8 +389,7 @@ class LiftingLine(ExplicitAnalysis):
             xyz_ref=self.xyz_ref,
         )
 
-        wing_aero = self.wing_aerodynamics()
-
+        wing_aero_components = self.wing_aerodynamics()
         fuselage_aero_components = [
             aerobuildup.fuselage_aerodynamics(
                 fuselage=fuse,
@@ -291,7 +398,7 @@ class LiftingLine(ExplicitAnalysis):
             for fuse in self.airplane.fuselages
         ]
 
-        aero_components = [wing_aero] + fuselage_aero_components
+        aero_components = list(wing_aero_components.values()) + fuselage_aero_components
 
         ### Sum up the forces
         F_g_total = [sum([comp.F_g[i] for comp in aero_components]) for i in range(3)]
@@ -338,7 +445,7 @@ class LiftingLine(ExplicitAnalysis):
         output["Cn"] = output["n_b"] / qS / b
 
         ##### Add the component aerodynamics, for reference
-        output["wing_aero"] = wing_aero
+        output["wing_aero_components"] = wing_aero_components
         output["fuselage_aero_components"] = fuselage_aero_components
 
         # ##### Add the drag breakdown
@@ -529,7 +636,7 @@ class LiftingLine(ExplicitAnalysis):
 
         return run_base
 
-    def wing_aerodynamics(self) -> AeroComponentResults:
+    def wing_aerodynamics(self) -> Dict[str, AeroComponentResults]:
         if self.verbose:
             print("Meshing...")
 
@@ -540,6 +647,7 @@ class LiftingLine(ExplicitAnalysis):
         front_right_vertices = []
         airfoils: List[Airfoil] = []
         control_surfaces: List[List[ControlSurface]] = []
+        panel_owner = []
 
         for wing in self.airplane.wings:  # subdivide the wing in more spanwise sections
             if self.spanwise_resolution > 1:
@@ -553,6 +661,9 @@ class LiftingLine(ExplicitAnalysis):
                 chordwise_resolution=1,
                 add_camber=False,
             )
+
+            n_panels_this_side = faces.shape[0]
+            panel_owner.extend([wing.name] * n_panels_this_side)
 
             front_left_vertices.append(points[faces[:, 0], :])
             back_left_vertices.append(points[faces[:, 1], :])
@@ -598,6 +709,7 @@ class LiftingLine(ExplicitAnalysis):
         back_left_vertices = np.concatenate(back_left_vertices)
         back_right_vertices = np.concatenate(back_right_vertices)
         front_right_vertices = np.concatenate(front_right_vertices)
+        panel_owner = np.array(panel_owner)
 
         ### Compute panel statistics
         diag1 = front_right_vertices - back_left_vertices
@@ -863,7 +975,6 @@ class LiftingLine(ExplicitAnalysis):
         moment_profile_geometry = np.sum(moments_profile_geometry, axis=0)
 
         # Compute pitching moment
-
         bound_leg_YZ = vortex_bound_leg
         bound_leg_YZ[:, 0] = 0
         moments_pitching_geometry = (
@@ -872,25 +983,44 @@ class LiftingLine(ExplicitAnalysis):
             * tall(chords**2)
             * bound_leg_YZ
         )
-        moment_pitching_geometry = np.sum(moments_pitching_geometry, axis=0)
+        panel_forces_total = forces_inviscid_geometry + forces_profile_geometry
+        panel_moments_total = (
+            moments_inviscid_geometry
+            + moments_profile_geometry
+            + moments_pitching_geometry
+        )
 
         if self.verbose:
             print("Calculating total forces and moments...")
 
-        force_total_geometry = np.add(force_inviscid_geometry, force_profile_geometry)
-        moment_total_geometry = (
-            np.add(moment_inviscid_geometry, moment_profile_geometry)
-            + moment_pitching_geometry
-        )
+        wing_results = {}
 
-        return self.AeroComponentResults(
-            s_ref=self.airplane.s_ref,
-            c_ref=self.airplane.c_ref,
-            b_ref=self.airplane.b_ref,
-            op_point=self.op_point,
-            F_g=force_total_geometry,
-            M_g=moment_total_geometry,
-        )
+        for wing in self.airplane.wings:
+            mask = panel_owner == wing.name
+
+            wing_results[wing.name] = self.AeroComponentResults(
+                s_ref=wing.area(),
+                c_ref=wing.mean_aerodynamic_chord(),
+                b_ref=wing.span(),
+                op_point=self.op_point,
+                F_g=np.sum(panel_forces_total[mask], axis=0),
+                M_g=np.sum(panel_moments_total[mask], axis=0),
+                panel_centers=vortex_centers[mask],
+                panel_areas=areas[mask],
+                panel_forces_g=panel_forces_total[mask],
+                panel_moments_g=panel_moments_total[mask],
+                panel_forces_g_inviscid=forces_inviscid_geometry[mask],
+                panel_forces_g_profile=forces_profile_geometry[mask],
+                panel_moments_g_inviscid=moments_inviscid_geometry[mask],
+                panel_moments_g_profile=moments_profile_geometry[mask],
+                panel_moments_g_pitching=moments_pitching_geometry[mask],
+                section_CL=CLs[mask],
+                section_CD=CDs[mask],
+                section_CM=CMs[mask],
+                panel_velocities=velocities[mask],
+            )
+
+        return wing_results
 
     def get_induced_velocity_at_points(
         self, points: np.ndarray, vortex_strengths: np.ndarray = None
