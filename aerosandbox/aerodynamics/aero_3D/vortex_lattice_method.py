@@ -104,6 +104,164 @@ class VortexLatticeMethod(ExplicitAnalysis):
             )
             + "\n)"
         )
+    
+    def get_panel_data(self, component=None, axis="wind") -> Dict[str, Any]:
+        xyz = self.vortex_centers
+        Fg = self.forces_geometry
+        Mg = self.moments_geometry
+        area = self.areas
+        q = self.op_point.dynamic_pressure()
+
+        Fw = np.array([
+            self.op_point.convert_axes(
+                Fg[i, 0], Fg[i, 1], Fg[i, 2],
+                from_axes="geometry",
+                to_axes=axis,
+            )
+            for i in range(len(Fg))
+        ])
+
+        Mw = np.array([
+            self.op_point.convert_axes(
+                Mg[i, 0], Mg[i, 1], Mg[i, 2],
+                from_axes="geometry",
+                to_axes=axis,
+            )
+            for i in range(len(Mg))
+        ])
+
+        mask = np.ones(len(xyz), dtype=bool)
+        if component is not None:
+            if isinstance(component, str):
+                mask = self.panel_component_names == component
+            else:
+                mask = self.panel_component_ids == component
+
+        xyz = xyz[mask]
+        Fg = Fg[mask]
+        Mg = Mg[mask]
+        Fw = Fw[mask]
+        Mw = Mw[mask]
+        area = area[mask]
+        strip_ids = self.panel_strip_ids[mask]
+
+        # Local force coefficients per panel, referenced to panel area
+        CDi_panel = -Fw[:, 0] / (q * area)
+        CY_panel  =  Fw[:, 1] / (q * area)
+        CL_panel  = -Fw[:, 2] / (q * area)
+
+        return {
+            "xyz": xyz,
+            "F_g": Fg,
+            "M_g": Mg,
+            "F_w": Fw,
+            "M_w": Mw,
+            "area": area,
+            "strip_ids": strip_ids,
+            "CDi_panel": CDi_panel,
+            "CY_panel": CY_panel,
+            "CL_panel": CL_panel,
+        }
+
+    def get_strip_distribution(self, component=None, axis="y") -> Dict[str, Any]:
+        """
+        
+        """
+        pdata = self.get_panel_data(component=component)
+
+        xyz = pdata["xyz"]
+        Fw = pdata["F_w"]
+        Mw = pdata["M_w"]
+        area = pdata["area"]
+        strip_ids = pdata["strip_ids"]
+        q = self.op_point.dynamic_pressure()
+
+        if axis == "x":
+            coord_index = 0
+        elif axis == "y":
+            coord_index = 1
+        elif axis == "z":
+            coord_index = 2
+        else:
+            raise ValueError("axis must be 'x', 'y', or 'z'")
+
+        unique_strip_ids = np.unique(strip_ids)
+
+        coord = []
+        Fw_strip = []
+        Mw_strip = []
+        area_strip = []
+        CL_strip = []
+        CY_strip = []
+        CDi_strip = []
+        Cl_strip = []
+        Cm_strip = []
+        Cn_strip = []
+
+        for sid in unique_strip_ids:
+            m = strip_ids == sid
+
+            coord.append(np.mean(xyz[m, coord_index]))
+
+            F_sum = np.sum(Fw[m], axis=0)
+            M_sum = np.sum(Mw[m], axis=0)
+            S_sum = np.sum(area[m])
+
+            Fw_strip.append(F_sum)
+            Mw_strip.append(M_sum)
+            area_strip.append(S_sum)
+
+            CDi_strip.append(-F_sum[0] / (q * S_sum))
+            CY_strip.append( F_sum[1] / (q * S_sum))
+            CL_strip.append(-F_sum[2] / (q * S_sum))
+
+            Cl_strip.append(M_sum[0] / (q * S_sum * self.airplane.b_ref))
+            Cm_strip.append(M_sum[1] / (q * S_sum * self.airplane.c_ref))
+            Cn_strip.append(M_sum[2] / (q * S_sum * self.airplane.b_ref))
+
+        coord = np.array(coord)
+        Fw_strip = np.array(Fw_strip)
+        Mw_strip = np.array(Mw_strip)
+        area_strip = np.array(area_strip)
+        CDi_strip = np.array(CDi_strip)
+        CY_strip = np.array(CY_strip)
+        CL_strip = np.array(CL_strip)
+        Cl_strip = np.array(Cl_strip)
+        Cm_strip = np.array(Cm_strip)
+        Cn_strip = np.array(Cn_strip)
+
+        order = np.argsort(coord)
+        coord = coord[order]
+        Fw_strip = Fw_strip[order]
+        Mw_strip = Mw_strip[order]
+        area_strip = area_strip[order]
+        CDi_strip = CDi_strip[order]
+        CY_strip = CY_strip[order]
+        CL_strip = CL_strip[order]
+        Cl_strip = Cl_strip[order]
+        Cm_strip = Cm_strip[order]
+        Cn_strip = Cn_strip[order]
+
+        dcoord = np.gradient(coord)
+
+        f_w_prime = Fw_strip / dcoord[:, None]
+        m_w_prime = Mw_strip / dcoord[:, None]
+
+        return {
+            axis: coord,
+            "F_w_strip": Fw_strip, # Total force on each strip, in wind axes
+            "M_w_strip": Mw_strip, # Total moment on each strip, in wind axes
+            "f_w_prime": f_w_prime, # Force per unit length on each strip, in wind axes
+            "m_w_prime": m_w_prime, # Moment per unit length on each strip, in wind axes
+            "area_strip": area_strip,
+            "CDi_strip": CDi_strip,
+            "CY_strip": CY_strip,
+            "CL_strip": CL_strip,
+            "Cl_strip": Cl_strip,
+            "Cm_strip": Cm_strip,
+            "Cn_strip": Cn_strip,
+            "d" + axis: dcoord,
+        }
 
     def run(self) -> Dict[str, Any]:
         """
@@ -142,8 +300,11 @@ class VortexLatticeMethod(ExplicitAnalysis):
         back_right_vertices = []
         front_right_vertices = []
         is_trailing_edge = []
+        panel_component_ids = []
+        panel_component_names = []
+        panel_strip_ids = []
 
-        for wing in self.airplane.wings:
+        for i_wing, wing in enumerate(self.airplane.wings):
             if self.spanwise_resolution > 1:
                 wing = wing.subdivide_sections(
                     ratio=self.spanwise_resolution,
@@ -156,6 +317,13 @@ class VortexLatticeMethod(ExplicitAnalysis):
                 chordwise_spacing_function=self.chordwise_spacing_function,
                 add_camber=True,
             )
+            n_faces = len(faces)
+            n_chord = self.chordwise_resolution
+            local_strip_ids = np.arange(n_faces) // n_chord
+            
+            panel_component_ids.append(np.full(n_faces, i_wing))
+            panel_component_names.append(np.full(n_faces, wing.name, dtype=object))
+            panel_strip_ids.append(local_strip_ids)
             front_left_vertices.append(points[faces[:, 0], :])
             back_left_vertices.append(points[faces[:, 1], :])
             back_right_vertices.append(points[faces[:, 2], :])
@@ -169,7 +337,9 @@ class VortexLatticeMethod(ExplicitAnalysis):
         back_right_vertices = np.concatenate(back_right_vertices)
         front_right_vertices = np.concatenate(front_right_vertices)
         is_trailing_edge = np.concatenate(is_trailing_edge)
-
+        panel_component_ids = np.concatenate(panel_component_ids)
+        panel_component_names = np.concatenate(panel_component_names)
+        panel_strip_ids = np.concatenate(panel_strip_ids)
         ### Compute panel statistics
         diag1 = front_right_vertices - back_left_vertices
         diag2 = front_left_vertices - back_right_vertices
@@ -200,7 +370,9 @@ class VortexLatticeMethod(ExplicitAnalysis):
         self.vortex_centers = vortex_centers
         self.vortex_bound_leg = vortex_bound_leg
         self.collocation_points = collocation_points
-
+        self.panel_component_ids = panel_component_ids
+        self.panel_component_names = panel_component_names
+        self.panel_strip_ids = panel_strip_ids
         ##### Setup Operating Point
         if self.verbose:
             print("Calculating the freestream influence...")
